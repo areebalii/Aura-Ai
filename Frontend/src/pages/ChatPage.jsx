@@ -1,15 +1,76 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import Sidebar from '../components/Sidebar';
 import AuthModal from '../components/AuthModal';
 import API from '../api/axios.instance';
+
+const animationStyles = `
+  @keyframes slideUpFade {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .animate-chat-entry {
+    animation: slideUpFade 0.45s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+`;
+
+function CodeBlockWrapper({ children, className, ...props }) {
+  const [copied, setCopied] = useState(false);
+  const match = /language-(\w+)/.exec(className || '');
+  const language = match ? match[1] : 'text';
+  const rawCode = String(children).replace(/\n$/, '');
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(rawCode);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error("Failed to copy code to clipboard:", err);
+    }
+  };
+
+  return (
+    <div className="relative group/code my-5 rounded-xl overflow-hidden border border-[#2d2f31] shadow-xl">
+      <div className="flex justify-between items-center px-4 py-2 bg-[#18191a] text-xs text-gray-400 select-none border-b border-[#2d2f31]/60">
+        <span className="font-mono tracking-wider text-[10px] uppercase font-semibold text-gray-500">
+          {language}
+        </span>
+        <button
+          type="button"
+          onClick={handleCopy}
+          className="hover:text-white transition-colors bg-[#2a2b2d] hover:bg-[#333537] px-2.5 py-1 rounded-md text-[11px] font-medium flex items-center gap-1 active:scale-95 border border-[#3c3e41]"
+        >
+          {copied ? '✅ Copied!' : '📋 Copy Code'}
+        </button>
+      </div>
+      <div className="text-xs font-mono">
+        <SyntaxHighlighter
+          style={vscDarkPlus}
+          language={language}
+          PreTag="div"
+          customStyle={{
+            margin: 0,
+            padding: '1rem',
+            background: '#1e1f20',
+            fontSize: '0.85rem',
+            lineHeight: '1.5',
+          }}
+          {...props}
+        >
+          {rawCode}
+        </SyntaxHighlighter>
+      </div>
+    </div>
+  );
+}
 
 export default function ChatPage() {
   const [user, setUser] = useState(null);
   const [guestQuestionCount, setGuestQuestionCount] = useState(0);
   const [isModalOpen, setIsModalOpen] = useState(false);
-
-  // Responsive state for the mobile sidebar drawer
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
   const [chatHistory, setChatHistory] = useState([]);
@@ -19,6 +80,16 @@ export default function ChatPage() {
   ]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
+
+  const chatContainerRef = useRef(null);
+  const textareaRef = useRef(null);
+
+  // 🛠️ NEW: Playback Engine Refs to prevent React re-renders from breaking timing loops
+  const wordQueueRef = useRef([]);
+  const playbackIntervalRef = useRef(null);
+  const streamFinishedRef = useRef(false);
+  const currentMessageTextRef = useRef('');
 
   useEffect(() => {
     const localUser = localStorage.getItem('aura_user');
@@ -30,21 +101,35 @@ export default function ChatPage() {
       setMessages([{ role: 'model', text: `Welcome back, ${parsedUser.fullName}! I am Aura. How can I help you build today?` }]);
       fetchChatHistory();
     }
+
+    // Cleanup playback loops on unmount
+    return () => clearInterval(playbackIntervalRef.current);
   }, []);
 
-  // 1. UPDATE YOUR FETCH HISTORY (To read the saved ID upon browser loading)
+  useEffect(() => {
+    if (!isStreaming && chatContainerRef.current) {
+      chatContainerRef.current.scrollTo({
+        top: chatContainerRef.current.scrollHeight,
+        behavior: 'smooth'
+      });
+    }
+  }, [messages.length, isStreaming]);
+
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 200)}px`;
+    }
+  }, [input]);
+
   const fetchChatHistory = async () => {
     try {
       const response = await API.get('/chat/history');
       setChatHistory(response.data);
 
-      // Check if there's a saved chat ID from before the page reload
       const savedChatId = localStorage.getItem('aura_active_chat_id');
-
       if (savedChatId && response.data.length > 0) {
-        // Find the chat object inside your freshly loaded history array
         const matchingChat = response.data.find(chat => chat._id === savedChatId);
-
         if (matchingChat) {
           setActiveChat(matchingChat);
           if (matchingChat.messages && matchingChat.messages.length > 0) {
@@ -57,12 +142,9 @@ export default function ChatPage() {
     }
   };
 
-  // 2. UPDATE SELECT CHAT (Save the selected chat ID to storage)
   const handleSelectChat = (chat) => {
     setActiveChat(chat);
     setIsSidebarOpen(false);
-
-    // Save to localStorage so a reload stays on this thread
     localStorage.setItem('aura_active_chat_id', chat._id);
 
     if (chat.messages && chat.messages.length > 0) {
@@ -72,10 +154,47 @@ export default function ChatPage() {
     }
   };
 
-  // 3. UPDATE SEND HANDLER (Save the ID when a brand new thread gets created)
+  const startPlaybackEngine = () => {
+    // Clear any lingering ticker loops before launching a new one
+    clearInterval(playbackIntervalRef.current);
+
+    // Reset our text buffer references
+    currentMessageTextRef.current = '';
+    streamFinishedRef.current = false;
+    wordQueueRef.current = [];
+
+    // 💡 PLAYBACK TICKER: Pulls text segments at a uniform, human-readable speed
+    playbackIntervalRef.current = setInterval(() => {
+      if (wordQueueRef.current.length > 0) {
+        const nextSegment = wordQueueRef.current.shift();
+        currentMessageTextRef.current += nextSegment;
+
+        setMessages(prev => {
+          const updated = [...prev];
+          const lastIndex = updated.length - 1;
+          if (lastIndex >= 0 && updated[lastIndex].role === 'model') {
+            updated[lastIndex].text = currentMessageTextRef.current;
+          }
+          return updated;
+        });
+
+        // Anchor container scroll position strictly onto the new painted line
+        requestAnimationFrame(() => {
+          if (chatContainerRef.current) {
+            chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+          }
+        });
+      } else if (streamFinishedRef.current) {
+        // The network channel is empty AND the playback queue has completely drained out
+        clearInterval(playbackIntervalRef.current);
+        setIsStreaming(false);
+      }
+    }, 40); // 💡 ADJUST SPEED HERE: 40ms per word cluster yields a highly cinematic output pace.
+  };
+
   const handleSend = async (e) => {
-    e.preventDefault();
-    if (!input.trim() || loading) return;
+    if (e) e.preventDefault();
+    if (!input.trim() || loading || isStreaming) return;
 
     if (!user && guestQuestionCount >= 2) {
       setIsModalOpen(true);
@@ -84,58 +203,133 @@ export default function ChatPage() {
 
     const userPrompt = input;
     const userMessage = { role: 'user', text: userPrompt };
-    const currentMessages = [...messages, userMessage];
 
-    setMessages(currentMessages);
+    setMessages(prev => [...prev, userMessage]);
     setInput('');
     setLoading(true);
 
     if (!user) {
       setGuestQuestionCount(prev => prev + 1);
-      simulateAIReply(currentMessages, userPrompt);
+      simulateAIReply([...messages, userMessage], userPrompt);
     } else {
       try {
         let currentChatId = activeChat?._id;
 
         if (!activeChat) {
-          // If it's a brand new chat, generate it via backend
-          const newChatResponse = await API.post('/chat/new', { title: userPrompt.substring(0, 24) + '...' });
+          const newChatResponse = await API.post('/chat/new', { title: 'Generating Topic...' });
           currentChatId = newChatResponse.data._id;
-
-          // Save the brand new chat ID to storage instantly
           localStorage.setItem('aura_active_chat_id', currentChatId);
+          setActiveChat(newChatResponse.data);
         }
 
-        const response = await API.put(`/chat/${currentChatId}/append`, { messages: [userMessage] });
+        setMessages(prev => [...prev, { role: 'model', text: '' }]);
+        setLoading(false);
+        setIsStreaming(true);
 
-        setMessages(response.data.messages);
-        setActiveChat(response.data);
-        fetchChatHistory();
+        // Launch our decoupled visual playback clock
+        startPlaybackEngine();
+
+        const token = localStorage.getItem('aura_token');
+        const response = await fetch(`${API.defaults.baseURL || ''}/chat/${currentChatId}/append`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({ messages: [userMessage] })
+        });
+
+        if (!response.ok) throw new Error('Streaming connection pipeline failed.');
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let chunkBuffer = '';
+        let wordAccumulator = '';
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          chunkBuffer += decoder.decode(value, { stream: true });
+          const lines = chunkBuffer.split('\n');
+          chunkBuffer = lines.pop() || '';
+
+          for (const line of lines) {
+            const cleanLine = line.trim();
+            if (!cleanLine || !cleanLine.startsWith('data: ')) continue;
+
+            const rawJson = cleanLine.slice(6);
+            if (rawJson === '[DONE]') break;
+
+            try {
+              const parsedData = JSON.parse(rawJson);
+
+              if (parsedData.type === 'token') {
+                const tokenText = parsedData.text;
+
+                // Parse characters looking for true word boundary spaces or system breaks
+                for (let char of tokenText) {
+                  wordAccumulator += char;
+                  if (char === ' ' || char === '\n' || wordAccumulator.length >= 8) {
+                    wordQueueRef.current.push(wordAccumulator);
+                    wordAccumulator = '';
+                  }
+                }
+              } else if (parsedData.type === 'done') {
+                setActiveChat(parsedData.chat);
+                fetchChatHistory();
+              }
+            } catch (err) {
+              console.warn("Error parsing incoming SSE layout packet line context:", err);
+            }
+          }
+        }
+
+        // Push any remaining text fragments hanging in the buffer into the queue
+        if (wordAccumulator.length > 0) {
+          wordQueueRef.current.push(wordAccumulator);
+        }
+
+        // Signal to the ticker engine that the network stream has completed
+        streamFinishedRef.current = true;
 
       } catch (err) {
         console.error("Failed to sync message pipeline:", err);
-      } finally {
+        clearInterval(playbackIntervalRef.current);
         setLoading(false);
+        setIsStreaming(false);
+        setMessages(prev => [
+          ...prev,
+          { role: 'model', text: '⚠️ **Connection lost.** Failed to process the text stream.' }
+        ]);
       }
     }
   };
 
-  // 4. UPDATE NEW CHAT (Clear the storage value so it knows to start blank)
+  const simulateAIReply = (currentMessages, userPrompt) => {
+    setTimeout(() => {
+      setMessages([
+        ...currentMessages,
+        { role: 'model', text: `Guest execution echo response to: "${userPrompt}".` }
+      ]);
+      setLoading(false);
+      if (guestQuestionCount === 1) {
+        setTimeout(() => setIsModalOpen(true), 1000);
+      }
+    }, 800);
+  };
+
   const handleNewChat = () => {
     setActiveChat(null);
     setIsSidebarOpen(false);
-
-    // Clear the active ID out of storage for a fresh layout slate
     localStorage.removeItem('aura_active_chat_id');
-
     setMessages([{ role: 'model', text: 'Started a brand new conversation. Ask away!' }]);
   };
 
-  // 5. UPDATE LOGOUT AND DELETE HANDLERS (To completely scrub the storage key)
   const handleLogout = () => {
     localStorage.removeItem('aura_token');
     localStorage.removeItem('aura_user');
-    localStorage.removeItem('aura_active_chat_id'); // Clear on logout
+    localStorage.removeItem('aura_active_chat_id');
     setUser(null);
     setActiveChat(null);
     setChatHistory([]);
@@ -150,7 +344,6 @@ export default function ChatPage() {
       setChatHistory((prevHistory) => prevHistory.filter((chat) => chat._id !== chatId));
 
       if (activeChat?._id === chatId) {
-        // If the currently viewed chat was just deleted, clear it out of memory
         localStorage.removeItem('aura_active_chat_id');
         setActiveChat(null);
         setMessages([{ role: 'model', text: 'Hello! I am Aura. How can I help you today?' }]);
@@ -162,18 +355,16 @@ export default function ChatPage() {
 
   return (
     <div className="flex h-screen w-screen bg-[#131314] text-[#e3e3e3] overflow-hidden relative">
+      <style>{animationStyles}</style>
 
-      {/* Dimmed mobile backdrop overlay wrapper */}
       {isSidebarOpen && (
         <div
           onClick={() => setIsSidebarOpen(false)}
-          className="fixed inset-0 bg-black/60 z-30 md:hidden animate-fadeIn"
+          className="fixed inset-0 bg-black/60 z-30 md:hidden"
         />
       )}
 
-      {/* Responsive Sidebar container shell wrapper wrapper tracking state styles */}
-      <div className={`fixed md:static inset-y-0 left-0 z-40 transform ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'
-        } md:translate-x-0 transition-transform duration-300 ease-in-out h-full`}>
+      <div className={`fixed md:static inset-y-0 left-0 z-40 transform ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0 transition-transform duration-300 ease-in-out h-full`}>
         <Sidebar
           chatHistory={chatHistory}
           onNewChat={handleNewChat}
@@ -181,16 +372,14 @@ export default function ChatPage() {
           onLogout={handleLogout}
           activeChatId={activeChat?._id}
           onSelectChat={handleSelectChat}
-          onDeleteChat={handleDeleteChat} 
+          onDeleteChat={handleDeleteChat}
           onClose={() => setIsSidebarOpen(false)}
         />
       </div>
 
       <main className="flex-1 flex flex-col justify-between relative h-full w-full min-w-0">
-        {/* Top Header holding the Hamburger Navigation element */}
         <header className="p-4 flex justify-between items-center bg-[#131314]/80 backdrop-blur-md border-b border-[#2d2f31]">
           <div className="flex items-center gap-3">
-            {/* Hamburger Button element - Only visible on screens smaller than md tailwind width breakpoints */}
             <button
               onClick={() => setIsSidebarOpen(!isSidebarOpen)}
               className="md:hidden p-2 hover:bg-[#202123] active:bg-[#2d2f31] rounded-xl text-gray-400 hover:text-white transition-all focus:outline-none"
@@ -210,49 +399,62 @@ export default function ChatPage() {
           </div>
         </header>
 
-        {/* Message Area */}
-        <div className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 max-w-3xl w-full mx-auto">
-          {messages.map((msg, index) => (
-            <div key={index} className={`flex gap-4 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              {msg.role !== 'user' && (
-                <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-blue-500 to-purple-500 flex items-center justify-center text-xs font-bold shadow-md text-white shrink-0">
-                  A
-                </div>
-              )}
-              <div className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm transition-all ${msg.role === 'user'
-                ? 'bg-[#2b2c2e] text-white rounded-br-none'
-                : 'bg-transparent text-gray-200 sequential-markdown-layout'
-                }`}>
+        <div
+          ref={chatContainerRef}
+          className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 max-w-3xl w-full mx-auto scrollbar-thin scroll-smooth"
+        >
+          {messages.map((msg, index) => {
+            const isLastMessage = index === messages.length - 1;
 
-                {msg.role === 'user' ? (
-                  <p className="whitespace-pre-wrap">{msg.text}</p>
-                ) : (
-                  <div className="whitespace-pre-wrap leading-relaxed space-y-2.5">
-                    <ReactMarkdown
-                      components={{
-                        h1: ({ node, ...props }) => <h1 className="text-2xl font-bold mt-4 mb-2 text-white border-b border-[#2d2f31] pb-1" {...props} />,
-                        h2: ({ node, ...props }) => <h2 className="text-xl font-bold mt-4 mb-1.5 text-gray-100" {...props} />,
-                        h3: ({ node, ...props }) => <h3 className="text-lg font-semibold mt-3 mb-1 text-gray-200" {...props} />,
-                        p: ({ node, ...props }) => <p className="text-gray-300 mb-2.5 leading-relaxed" {...props} />,
-                        ul: ({ node, ...props }) => <ul className="list-disc pl-6 my-2 space-y-1 text-gray-300" {...props} />,
-                        ol: ({ node, ...props }) => <ol className="list-decimal pl-6 my-2 space-y-1 text-gray-300" {...props} />,
-                        li: ({ node, ...props }) => <li className="pl-0.5" {...props} />,
-                        strong: ({ node, ...props }) => <strong className="font-semibold text-blue-400" {...props} />,
-                        code: ({ node, inline, ...props }) => inline
-                          ? <code className="bg-[#2d2f31] px-1.5 py-0.5 rounded font-mono text-xs text-pink-400" {...props} />
-                          : <pre className="bg-[#1e1f20] p-4 rounded-xl overflow-x-auto my-3 border border-[#2d2f31] font-mono text-xs text-emerald-400 shadow-inner" {...props} />
-                      }}
-                    >
-                      {msg.text}
-                    </ReactMarkdown>
+            return (
+              <div
+                key={index}
+                className={`flex gap-4 ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-chat-entry`}
+              >
+                {msg.role !== 'user' && (
+                  <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-blue-500 to-purple-500 flex items-center justify-center text-xs font-bold shadow-md text-white shrink-0">
+                    A
                   </div>
                 )}
+
+                <div className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm transition-all shadow-sm ${msg.role === 'user'
+                    ? 'bg-[#2b2c2e] text-white rounded-br-none'
+                    : 'bg-transparent text-gray-200'
+                  }`}>
+                  {msg.role === 'user' ? (
+                    <p className="whitespace-pre-wrap">{msg.text}</p>
+                  ) : (
+                    <div className="whitespace-pre-wrap leading-relaxed space-y-2.5">
+                      <ReactMarkdown
+                        components={{
+                          h1: ({ node, ...props }) => <h1 className="text-2xl font-bold mt-4 mb-2 text-white border-b border-[#2d2f31] pb-1" {...props} />,
+                          h2: ({ node, ...props }) => <h2 className="text-xl font-bold mt-4 mb-1.5 text-gray-100" {...props} />,
+                          h3: ({ node, ...props }) => <h3 className="text-lg font-semibold mt-3 mb-1 text-gray-200" {...props} />,
+                          p: ({ node, ...props }) => <p className="text-gray-300 mb-2.5 leading-relaxed" {...props} />,
+                          ul: ({ node, ...props }) => <ul className="list-disc pl-6 my-2 space-y-1 text-gray-300" {...props} />,
+                          ol: ({ node, ...props }) => <ol className="list-decimal pl-6 my-2 space-y-1 text-gray-300" {...props} />,
+                          li: ({ node, ...props }) => <li className="pl-0.5" {...props} />,
+                          strong: ({ node, ...props }) => <strong className="font-semibold text-blue-400" {...props} />,
+                          code: ({ node, inline, className, ...props }) => inline
+                            ? <code className="bg-[#2d2f31] px-1.5 py-0.5 rounded font-mono text-xs text-pink-400" {...props} />
+                            : <CodeBlockWrapper className={className} {...props} />
+                        }}
+                      >
+                        {msg.text}
+                      </ReactMarkdown>
+
+                      {isLastMessage && isStreaming && (
+                        <span className="inline-block w-1.5 h-4 bg-blue-400 ml-1 animate-pulse rounded-full align-middle" />
+                      )}
+                    </div>
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
 
           {loading && (
-            <div className="flex gap-4 justify-start items-start animate-fadeIn">
+            <div className="flex gap-4 justify-start items-start">
               <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-blue-500 to-purple-500 flex items-center justify-center text-xs font-bold shadow-md text-white">
                 A
               </div>
@@ -265,27 +467,38 @@ export default function ChatPage() {
           )}
         </div>
 
-        {/* Input Bar */}
         <div className="p-4 max-w-3xl w-full mx-auto">
-          <form onSubmit={handleSend} className="relative flex items-center bg-[#1e1f20] rounded-full border border-[#2d2f31] focus-within:border-[#4b5563] px-4 py-3 shadow-lg">
-            <input
-              type="text"
+          <form
+            onSubmit={handleSend}
+            className="relative flex items-end bg-[#1e1f20] rounded-2xl border border-[#2d2f31] focus-within:border-[#4b5563] px-4 py-3 shadow-lg"
+          >
+            <textarea
+              ref={textareaRef}
+              rows={1}
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              disabled={(!user && guestQuestionCount >= 2) || loading}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  if (input.trim() && !loading && !isStreaming) {
+                    handleSend(e);
+                  }
+                }
+              }}
+              disabled={(!user && guestQuestionCount >= 2) || loading || isStreaming}
               placeholder={
-                loading
+                loading || isStreaming
                   ? "Aura is conceptualizing..."
                   : (!user && guestQuestionCount >= 2)
                     ? "Please log in to continue..."
-                    : "Message Aura..."
+                    : "Message Aura... (Shift + Enter for new line)"
               }
-              className="w-full bg-transparent text-sm focus:outline-none pr-12 text-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
+              className="w-full bg-transparent text-sm focus:outline-none pr-12 text-gray-200 disabled:opacity-50 disabled:cursor-not-allowed resize-none max-h-[200px] py-0.5 scrollbar-none"
             />
             <button
               type="submit"
-              disabled={(!user && guestQuestionCount >= 2) || loading || !input.trim()}
-              className="absolute right-3 bg-[#2a2b2d] hover:bg-[#383a3c] p-2 rounded-full transition-all text-xs disabled:opacity-40 text-gray-300"
+              disabled={(!user && guestQuestionCount >= 2) || loading || isStreaming || !input.trim()}
+              className="absolute right-3 bottom-2.5 bg-[#2a2b2d] hover:bg-[#383a3c] p-2 rounded-full transition-all text-xs disabled:opacity-40 text-gray-300 grid place-items-center h-8 w-8 active:scale-95"
             >
               ➔
             </button>

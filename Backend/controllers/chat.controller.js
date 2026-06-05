@@ -1,5 +1,8 @@
 import Chat from '../models/chat.model.js';
-import { generateAIResponse } from '../services/gemini.service.js';
+import { generateSmartTitle } from '../services/gemini.service.js';
+// Make sure you import your SDK model instance or a stream handler function from your service file
+// Example using Google Gen AI SDK or Groq SDK inside your controller logic:
+import { GoogleGenAI } from '@google/genai';
 
 // 1. CREATE A NEW CHAT SESSION THREAD
 export const createChat = async (req, res) => {
@@ -29,66 +32,113 @@ export const getUserChats = async (req, res) => {
   }
 };
 
-// 3. LIVE UPGRADED APPEND & GENERATE CONTROLLER METHOD
+// 3. LIVE UPGRADED APPEND & GENERATE CONTROLLER METHOD (STREAMING ENABLED)
 export const appendMessages = async (req, res) => {
   try {
     const { chatId } = req.params;
     const { messages } = req.body;
+    const userMessage = messages[0];
 
-    // Step A: Pull matching context records from MongoDB first without altering them
+    // Step A: Pull matching context records from MongoDB first
     const activeChat = await Chat.findOne({ _id: chatId, userId: req.user.id });
 
     if (!activeChat) {
       return res.status(404).json({ message: 'Conversation profile context not found.' });
     }
 
-    // Step B: Merge database history rows with incoming prompt values in local memory
-    const fullConversationContext = [...activeChat.messages, ...messages];
+    // Step B: Atomically append the user prompt to MongoDB immediately to protect context data state
+    await Chat.updateOne(
+      { _id: chatId, userId: req.user.id },
+      { $push: { messages: userMessage } }
+    );
+
+    // Step C: Set up standard HTTP response headers for Server-Sent Events (SSE)
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // Prevents Nginx/Proxy layers from blocking chunks
+
+    // Step D: Reconstruct the full historical array context chain for the upstream AI provider
+    const fullConversationContext = [...activeChat.messages, userMessage];
+
+    // Map your custom database message array format over to the structure your AI provider expects
+    const apiFormattedMessages = fullConversationContext.map(msg => ({
+      role: msg.role === 'model' ? 'model' : 'user', // Adjust if using Groq ('assistant' / 'user')
+      parts: [{ text: msg.text }] // Gemini format structure layout shape
+    }));
 
     let aiTextOutput = '';
 
     try {
-      // Step C: Securely request execution through the Google generation pipeline
-      aiTextOutput = await generateAIResponse(fullConversationContext);
-    } catch (apiError) {
-      console.warn("⚠️ Catching Upstream AI Pipeline Exception Gracefully:", apiError.message);
+      // Step E: Connect directly to your AI client interface stream layer.
+      // (This example reflects the standard @google/genai SDK format)
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const responseStream = await ai.models.generateContentStream({
+        model: 'gemini-2.5-flash',
+        contents: apiFormattedMessages,
+      });
 
-      const errorString = String(apiError.message || '') + String(apiError.stack || '');
+      // Step F: Loop through chunks in real time and flush them to your frontend
+      for await (const chunk of responseStream) {
+        const chunkText = chunk.text || '';
+        aiTextOutput += chunkText;
 
-      // Step D Check: Look for explicit 503 high demand signals or status codes
-      if (apiError.status === 503 || errorString.includes('503') || errorString.includes('UNAVAILABLE')) {
-        aiTextOutput =
-          "⚠️ **Aura is currently experiencing extremely high demand.**\n\n" +
-          "The upstream Gemini engine returned a temporary server capacity warning (`503 Service Unavailable`). " +
-          "Spikes in traffic are temporary. Please wait a few seconds and try resubmitting your prompt.";
-      } else {
-        aiTextOutput =
-          "⚠️ **An unexpected error disrupted the conversation loop iteration.**\n\n" +
-          "Failed to resolve response tokens safely through the active backend generation layer. Please try again.";
+        // Formulate correct SSE compliant text protocol formats
+        res.write(`data: ${JSON.stringify({ type: 'token', text: chunkText })}\n\n`);
       }
+
+    } catch (apiError) {
+      console.error("⚠️ Catching Upstream AI Pipeline Exception Gracefully:", apiError.message);
+
+      const errorString = String(apiError.message || '');
+      let fallbackText = "⚠️ An unexpected error disrupted the conversation generation loop.";
+
+      if (apiError.status === 503 || apiError.status === 429 || errorString.includes('503') || errorString.includes('UNAVAILABLE')) {
+        fallbackText = "⚠️ **Aura is under high load.** Spikes in traffic are temporary. Please try again in a moment.";
+      }
+
+      aiTextOutput += `\n\n${fallbackText}`;
+      res.write(`data: ${JSON.stringify({ type: 'token', text: fallbackText })}\n\n`);
     }
 
-    // Step E: Construct the official response layout object matching your schema profile
+    // Step G: Save the completed AI response bubble to your database
     const aiResponseBlock = {
       role: 'model',
       text: aiTextOutput
     };
 
-    // Step F: Atomic Database Push - Insert BOTH messages at the exact same millisecond mark
+    const isFirstMessagePair = activeChat.messages.length === 0;
+    let updatedFields = {
+      $push: { messages: aiResponseBlock },
+      $set: { updatedAt: Date.now() }
+    };
+
+    // Generate a smart topic summary title if it's a completely new discussion thread
+    if (isFirstMessagePair) {
+      try {
+        const smartTitle = await generateSmartTitle(userMessage.text);
+        updatedFields.$set.title = smartTitle;
+      } catch (titleErr) {
+        console.warn("Failed to generate custom title:", titleErr.message);
+      }
+    }
+
+    // Step H: Finalize MongoDB changes and retrieve the complete document state profile data
     const finalUpdatedChat = await Chat.findOneAndUpdate(
       { _id: chatId, userId: req.user.id },
-      {
-        $push: { messages: { $each: [...messages, aiResponseBlock] } },
-        $set: { updatedAt: Date.now() }
-      },
+      updatedFields,
       { returnDocument: 'after' }
     );
 
-    return res.status(200).json(finalUpdatedChat);
+    // Step I: Send down final structural metadata object parameters to update state controls securely
+    res.write(`data: ${JSON.stringify({ type: 'done', chat: finalUpdatedChat })}\n\n`);
+    res.end(); // Safely terminate the open connection channel loop safely
 
   } catch (error) {
     console.error("❌ Critical System Failure in appendMessages execution root:", error.message);
-    res.status(500).json({ message: 'Failed to process conversation loop iteration step.', error: error.message });
+    if (!res.headersSent) {
+      res.status(500).json({ message: 'Failed to process conversation loop iteration step.', error: error.message });
+    }
   }
 };
 

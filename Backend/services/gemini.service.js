@@ -105,3 +105,30 @@ export const generateAIResponse = async (historyMessages) => {
     throw error;
   }
 }; 
+
+/**
+ * Automatically summarizes a user's opening prompt into a clean 3-word title
+ * @param {string} firstPrompt 
+ * @returns {Promise<string>}
+ */
+export const generateSmartTitle = async (firstPrompt) => {
+  try {
+    const summaryCompletion = await groq.chat.completions.create({
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a specialized chat title generator. Summarize the user input into a concise, natural topic title of 2 to 4 words. Never use quotes, punctuation, prefixes, or markdown.'
+        },
+        { role: 'user', content: firstPrompt }
+      ],
+      model: 'llama-3.1-8b-instant', // Light and instant for micro-tasks
+      max_tokens: 12,
+      temperature: 0.5
+    });
+
+    return summaryCompletion.choices[0]?.message?.content?.trim() || 'New Conversation';
+  } catch (error) {
+    // Gracefully drop back to string slicing if title endpoint fails
+    return firstPrompt.substring(0, 24) + '...';
+  }
+};
