@@ -82,10 +82,14 @@ export default function ChatPage() {
   const [loading, setLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
 
+  const [selectedModel, setSelectedModel] = useState('gemini-2.5-flash');
+  const [attachedFile, setAttachedFile] = useState(null);
+  const [filePreview, setFilePreview] = useState(null);
+
   const chatContainerRef = useRef(null);
   const textareaRef = useRef(null);
+  const fileInputRef = useRef(null);
 
-  // 🛠️ NEW: Playback Engine Refs to prevent React re-renders from breaking timing loops
   const wordQueueRef = useRef([]);
   const playbackIntervalRef = useRef(null);
   const streamFinishedRef = useRef(false);
@@ -102,7 +106,6 @@ export default function ChatPage() {
       fetchChatHistory();
     }
 
-    // Cleanup playback loops on unmount
     return () => clearInterval(playbackIntervalRef.current);
   }, []);
 
@@ -154,16 +157,40 @@ export default function ChatPage() {
     }
   };
 
-  const startPlaybackEngine = () => {
-    // Clear any lingering ticker loops before launching a new one
-    clearInterval(playbackIntervalRef.current);
+  const handleFileChange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
 
-    // Reset our text buffer references
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
+    if (!allowedTypes.includes(file.type)) {
+      alert('Unsupported file context! Please upload an image (JPEG/PNG/WebP) or a PDF.');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      setAttachedFile({
+        name: file.name,
+        type: file.type,
+        base64: reader.result.split(',')[1]
+      });
+      setFilePreview(file.type.startsWith('image/') ? reader.result : 'pdf-icon');
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const clearAttachedFile = () => {
+    setAttachedFile(null);
+    setFilePreview(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const startPlaybackEngine = () => {
+    clearInterval(playbackIntervalRef.current);
     currentMessageTextRef.current = '';
     streamFinishedRef.current = false;
     wordQueueRef.current = [];
 
-    // 💡 PLAYBACK TICKER: Pulls text segments at a uniform, human-readable speed
     playbackIntervalRef.current = setInterval(() => {
       if (wordQueueRef.current.length > 0) {
         const nextSegment = wordQueueRef.current.shift();
@@ -178,23 +205,22 @@ export default function ChatPage() {
           return updated;
         });
 
-        // Anchor container scroll position strictly onto the new painted line
         requestAnimationFrame(() => {
           if (chatContainerRef.current) {
             chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
           }
         });
       } else if (streamFinishedRef.current) {
-        // The network channel is empty AND the playback queue has completely drained out
         clearInterval(playbackIntervalRef.current);
         setIsStreaming(false);
       }
-    }, 40); // 💡 ADJUST SPEED HERE: 40ms per word cluster yields a highly cinematic output pace.
+    }, 30);
   };
 
   const handleSend = async (e) => {
     if (e) e.preventDefault();
-    if (!input.trim() || loading || isStreaming) return;
+    if (!input.trim() && !attachedFile) return;
+    if (loading || isStreaming) return;
 
     if (!user && guestQuestionCount >= 2) {
       setIsModalOpen(true);
@@ -202,10 +228,16 @@ export default function ChatPage() {
     }
 
     const userPrompt = input;
-    const userMessage = { role: 'user', text: userPrompt };
+    const userMessage = {
+      role: 'user',
+      text: userPrompt,
+      mediaContext: attachedFile ? { name: attachedFile.name, type: attachedFile.type, url: filePreview } : null
+    };
 
     setMessages(prev => [...prev, userMessage]);
     setInput('');
+    const contextMediaPayload = attachedFile;
+    clearAttachedFile();
     setLoading(true);
 
     if (!user) {
@@ -226,7 +258,6 @@ export default function ChatPage() {
         setLoading(false);
         setIsStreaming(true);
 
-        // Launch our decoupled visual playback clock
         startPlaybackEngine();
 
         const token = localStorage.getItem('aura_token');
@@ -236,7 +267,11 @@ export default function ChatPage() {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${token}`
           },
-          body: JSON.stringify({ messages: [userMessage] })
+          body: JSON.stringify({
+            messages: [{ role: 'user', text: userPrompt }],
+            model: selectedModel,
+            media: contextMediaPayload
+          })
         });
 
         if (!response.ok) throw new Error('Streaming connection pipeline failed.');
@@ -266,8 +301,6 @@ export default function ChatPage() {
 
               if (parsedData.type === 'token') {
                 const tokenText = parsedData.text;
-
-                // Parse characters looking for true word boundary spaces or system breaks
                 for (let char of tokenText) {
                   wordAccumulator += char;
                   if (char === ' ' || char === '\n' || wordAccumulator.length >= 8) {
@@ -285,12 +318,9 @@ export default function ChatPage() {
           }
         }
 
-        // Push any remaining text fragments hanging in the buffer into the queue
         if (wordAccumulator.length > 0) {
           wordQueueRef.current.push(wordAccumulator);
         }
-
-        // Signal to the ticker engine that the network stream has completed
         streamFinishedRef.current = true;
 
       } catch (err) {
@@ -358,10 +388,7 @@ export default function ChatPage() {
       <style>{animationStyles}</style>
 
       {isSidebarOpen && (
-        <div
-          onClick={() => setIsSidebarOpen(false)}
-          className="fixed inset-0 bg-black/60 z-30 md:hidden"
-        />
+        <div onClick={() => setIsSidebarOpen(false)} className="fixed inset-0 bg-black/60 z-30 md:hidden" />
       )}
 
       <div className={`fixed md:static inset-y-0 left-0 z-40 transform ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0 transition-transform duration-300 ease-in-out h-full`}>
@@ -390,6 +417,16 @@ export default function ChatPage() {
               </svg>
             </button>
             <h1 className="text-xl font-semibold text-gray-200">Aura AI</h1>
+
+            <select
+              value={selectedModel}
+              onChange={(e) => setSelectedModel(e.target.value)}
+              className="ml-2 bg-[#1e1f20] border border-[#2d2f31] rounded-xl px-3 py-1 text-xs font-medium text-gray-300 focus:outline-none focus:border-blue-500 cursor-pointer transition-colors"
+            >
+              <option value="gemini-2.5-flash">✨ Gemini 2.5 Flash</option>
+              <option value="gemini-2.5-pro">🧠 Gemini 2.5 Pro</option>
+              <option value="groq-2">⚡ Grok / Llama Cluster</option>
+            </select>
           </div>
 
           <div className="flex items-center gap-3">
@@ -399,18 +436,12 @@ export default function ChatPage() {
           </div>
         </header>
 
-        <div
-          ref={chatContainerRef}
-          className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 max-w-3xl w-full mx-auto scrollbar-thin scroll-smooth"
-        >
+        <div ref={chatContainerRef} className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 max-w-3xl w-full mx-auto scrollbar-thin scroll-smooth">
           {messages.map((msg, index) => {
             const isLastMessage = index === messages.length - 1;
 
             return (
-              <div
-                key={index}
-                className={`flex gap-4 ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-chat-entry`}
-              >
+              <div key={index} className={`flex gap-4 ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-chat-entry`}>
                 {msg.role !== 'user' && (
                   <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-blue-500 to-purple-500 flex items-center justify-center text-xs font-bold shadow-md text-white shrink-0">
                     A
@@ -418,11 +449,25 @@ export default function ChatPage() {
                 )}
 
                 <div className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm transition-all shadow-sm ${msg.role === 'user'
-                    ? 'bg-[#2b2c2e] text-white rounded-br-none'
-                    : 'bg-transparent text-gray-200'
+                  ? 'bg-[#2b2c2e] text-white rounded-br-none'
+                  : 'bg-transparent text-gray-200'
                   }`}>
                   {msg.role === 'user' ? (
-                    <p className="whitespace-pre-wrap">{msg.text}</p>
+                    <div className="space-y-2">
+                      {msg.mediaContext && (
+                        <div className="mb-2 max-w-[200px] rounded-lg overflow-hidden border border-[#3c3e41]">
+                          {msg.mediaContext.url === 'pdf-icon' ? (
+                            <div className="bg-[#1e1f20] p-3 flex items-center gap-2 text-xs text-gray-300">
+                              <span>📄</span>
+                              <span className="truncate font-mono">{msg.mediaContext.name}</span>
+                            </div>
+                          ) : (
+                            <img src={msg.mediaContext.url} alt="Uploaded attachment context snippet" className="w-full object-cover max-h-[150px]" />
+                          )}
+                        </div>
+                      )}
+                      <p className="whitespace-pre-wrap">{msg.text}</p>
+                    </div>
                   ) : (
                     <div className="whitespace-pre-wrap leading-relaxed space-y-2.5">
                       <ReactMarkdown
@@ -437,7 +482,12 @@ export default function ChatPage() {
                           strong: ({ node, ...props }) => <strong className="font-semibold text-blue-400" {...props} />,
                           code: ({ node, inline, className, ...props }) => inline
                             ? <code className="bg-[#2d2f31] px-1.5 py-0.5 rounded font-mono text-xs text-pink-400" {...props} />
-                            : <CodeBlockWrapper className={className} {...props} />
+                            : <CodeBlockWrapper className={className} {...props} />,
+                          img: ({ node, ...props }) => (
+                            <div className="my-4 rounded-xl overflow-hidden border border-[#2d2f31] max-w-xl shadow-lg">
+                              <img className="w-full object-cover h-auto max-h-[400px]" loading="lazy" {...props} alt={props.alt || "AI Graphic Asset"} />
+                            </div>
+                          )
                         }}
                       >
                         {msg.text}
@@ -455,9 +505,7 @@ export default function ChatPage() {
 
           {loading && (
             <div className="flex gap-4 justify-start items-start">
-              <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-blue-500 to-purple-500 flex items-center justify-center text-xs font-bold shadow-md text-white">
-                A
-              </div>
+              <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-blue-500 to-purple-500 flex items-center justify-center text-xs font-bold shadow-md text-white">A</div>
               <div className="bg-[#1e1f20] border border-[#2d2f31] rounded-2xl rounded-bl-none px-5 py-4 text-sm text-gray-400 flex items-center gap-1.5 shadow-md">
                 <span className="w-2 h-2 bg-blue-400 rounded-full animate-bounce [animation-delay:-0.3s]"></span>
                 <span className="w-2 h-2 bg-purple-400 rounded-full animate-bounce [animation-delay:-0.15s]"></span>
@@ -467,11 +515,40 @@ export default function ChatPage() {
           )}
         </div>
 
-        <div className="p-4 max-w-3xl w-full mx-auto">
-          <form
-            onSubmit={handleSend}
-            className="relative flex items-end bg-[#1e1f20] rounded-2xl border border-[#2d2f31] focus-within:border-[#4b5563] px-4 py-3 shadow-lg"
-          >
+        <div className="p-4 max-w-3xl w-full mx-auto space-y-2">
+          {filePreview && (
+            <div className="flex items-center gap-3 bg-[#1e1f20] border border-[#2d2f31] p-2.5 rounded-xl max-w-xs animate-chat-entry relative group">
+              {filePreview === 'pdf-icon' ? (
+                <div className="w-10 h-10 bg-[#2b2c2e] rounded-lg flex items-center justify-center text-lg">📄</div>
+              ) : (
+                <img src={filePreview} alt="Upload thumb track" className="w-10 h-10 object-cover rounded-lg border border-[#3c3e41]" />
+              )}
+              <div className="flex-1 min-w-0 text-xs">
+                <p className="text-gray-300 font-medium truncate">{attachedFile?.name}</p>
+                <p className="text-gray-500 uppercase font-mono tracking-tighter text-[9px]">{attachedFile?.type.split('/')[1]}</p>
+              </div>
+              <button
+                type="button"
+                onClick={clearAttachedFile}
+                className="bg-black/50 hover:bg-red-500/80 text-white rounded-full p-1 transition-colors text-[10px]"
+              >
+                ✕
+              </button>
+            </div>
+          )}
+
+          <form onSubmit={handleSend} className="relative flex items-end bg-[#1e1f20] rounded-2xl border border-[#2d2f31] focus-within:border-[#4b5563] pl-12 pr-12 py-3 shadow-lg">
+            <input type="file" ref={fileInputRef} onChange={handleFileChange} accept="image/*,application/pdf" className="hidden" />
+
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={loading || isStreaming}
+              className="absolute left-3 bottom-2.5 bg-[#2a2b2d] hover:bg-[#383a3c] p-2 rounded-full transition-all text-sm text-gray-400 hover:text-white disabled:opacity-40 h-8 w-8 flex items-center justify-center active:scale-95"
+            >
+              📎
+            </button>
+
             <textarea
               ref={textareaRef}
               rows={1}
@@ -480,7 +557,7 @@ export default function ChatPage() {
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
-                  if (input.trim() && !loading && !isStreaming) {
+                  if ((input.trim() || attachedFile) && !loading && !isStreaming) {
                     handleSend(e);
                   }
                 }
@@ -493,19 +570,18 @@ export default function ChatPage() {
                     ? "Please log in to continue..."
                     : "Message Aura... (Shift + Enter for new line)"
               }
-              className="w-full bg-transparent text-sm focus:outline-none pr-12 text-gray-200 disabled:opacity-50 disabled:cursor-not-allowed resize-none max-h-[200px] py-0.5 scrollbar-none"
+              className="w-full bg-transparent text-sm focus:outline-none text-gray-200 disabled:opacity-50 disabled:cursor-not-allowed resize-none max-h-[200px] py-0.5 scrollbar-none"
             />
+
             <button
               type="submit"
-              disabled={(!user && guestQuestionCount >= 2) || loading || isStreaming || !input.trim()}
+              disabled={(!user && guestQuestionCount >= 2) || loading || isStreaming || (!input.trim() && !attachedFile)}
               className="absolute right-3 bottom-2.5 bg-[#2a2b2d] hover:bg-[#383a3c] p-2 rounded-full transition-all text-xs disabled:opacity-40 text-gray-300 grid place-items-center h-8 w-8 active:scale-95"
             >
               ➔
             </button>
           </form>
-          <p className="text-[11px] text-center text-gray-500 mt-2">
-            Aura can make mistakes. Verify important info.
-          </p>
+          <p className="text-[11px] text-center text-gray-500 mt-2">Aura can make mistakes. Verify important info.</p>
         </div>
       </main>
 
