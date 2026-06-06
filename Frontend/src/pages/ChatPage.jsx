@@ -72,7 +72,7 @@ export default function ChatPage() {
   const [guestQuestionCount, setGuestQuestionCount] = useState(0);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-
+  const [isHistoryLoading, setIsHistoryLoading] = useState(true);
   const [chatHistory, setChatHistory] = useState([]);
   const [activeChat, setActiveChat] = useState(null);
   const [messages, setMessages] = useState([
@@ -126,6 +126,7 @@ export default function ChatPage() {
   }, [input]);
 
   const fetchChatHistory = async () => {
+    setIsHistoryLoading(true);
     try {
       const response = await API.get('/chat/history');
       setChatHistory(response.data);
@@ -142,6 +143,8 @@ export default function ChatPage() {
       }
     } catch (err) {
       console.error("Error collecting chat analytics:", err);
+    } finally { 
+      setIsHistoryLoading(false); 
     }
   };
 
@@ -397,6 +400,9 @@ export default function ChatPage() {
 
       <div className={`fixed md:static inset-y-0 left-0 z-40 transform ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0 transition-transform duration-300 ease-in-out h-full`}>
         <Sidebar
+          isLoading={isHistoryLoading} 
+          chatHistory={chatHistory}
+          onNewChat={handleNewChat}
           chatHistory={chatHistory}
           onNewChat={handleNewChat}
           user={user}

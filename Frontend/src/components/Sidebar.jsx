@@ -1,7 +1,7 @@
-import React from 'react';
 import { useNavigate } from 'react-router-dom';
 
 export default function Sidebar({
+  isLoading,
   chatHistory,
   onNewChat,
   user,
@@ -9,9 +9,14 @@ export default function Sidebar({
   activeChatId,
   onSelectChat,
   onClose,
-  onDeleteChat 
+  onDeleteChat
 }) {
   const navigate = useNavigate();
+
+  // Skeleton UI for the loading state
+  const SkeletonItem = () => (
+    <div className="w-full h-[46px] bg-[#2a2b2d]/20 rounded-xl animate-pulse mb-1 border border-[#2d2f31]" />
+  );
 
   return (
     <aside className="w-64 bg-[#1e1f20] p-4 flex flex-col justify-between h-full border-r border-[#2d2f31] relative">
@@ -39,21 +44,28 @@ export default function Sidebar({
 
         {/* History List Container Track */}
         <div className="flex flex-col gap-1 overflow-y-auto max-h-[65vh] custom-sidebar-scrollbar">
-          <p className="text-xs font-semibold text-gray-500 px-3 mb-2 uppercase tracking-wider">Recent Conversations</p>
+          <p className="text-xs font-semibold text-gray-500 px-3 mb-2 uppercase tracking-wider">
+            {isLoading ? 'Loading...' : 'Recent Conversations'}
+          </p>
 
-          {chatHistory.length === 0 ? (
+          {isLoading ? (
+            // Render Skeleton items while fetching
+            <div className="flex flex-col gap-1">
+              {[...Array(6)].map((_, i) => <SkeletonItem key={i} />)}
+            </div>
+          ) : chatHistory.length === 0 ? (
+            // Render Empty state
             <p className="text-xs text-gray-600 px-3 italic py-2">No recent chats</p>
           ) : (
+            // Render Actual list
             chatHistory.map((chat) => (
-              // Changed container to a group flex row to house text selection and delete icon neatly
               <div
                 key={chat._id}
                 className={`group w-full flex items-center justify-between text-sm rounded-xl transition-all text-gray-300 ${activeChatId === chat._id
-                    ? 'bg-[#2a2b2d] font-medium text-white border-l-4 border-blue-500'
-                    : 'hover:bg-[#2a2b2d]/40 hover:text-gray-100'
+                  ? 'bg-[#2a2b2d] font-medium text-white border-l-4 border-blue-500'
+                  : 'hover:bg-[#2a2b2d]/40 hover:text-gray-100'
                   }`}
               >
-                {/* Select Click Target Area */}
                 <button
                   onClick={() => onSelectChat(chat)}
                   className={`flex-1 text-left py-2.5 px-3 truncate flex items-center gap-2.5 min-w-0 ${activeChatId === chat._id ? 'pl-2' : ''
@@ -63,10 +75,9 @@ export default function Sidebar({
                   <span className="truncate">{chat.title || 'New Conversation'}</span>
                 </button>
 
-                {/* Delete Trigger Action Button */}
                 <button
                   onClick={(e) => {
-                    e.stopPropagation(); // Stop clicking this button from selecting the chat row
+                    e.stopPropagation();
                     if (window.confirm("Are you sure you want to delete this chat?")) {
                       onDeleteChat(chat._id);
                     }
