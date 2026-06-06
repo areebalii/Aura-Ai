@@ -42,7 +42,11 @@ export const appendMessages = async (req, res) => {
     const persistedUserMsg = {
       role: 'user',
       text: userMessage.text,
-      mediaContext: media ? { name: media.name, type: media.type } : null
+      mediaContext: media ? {
+        name: media.name,
+        type: media.type,
+        url: `data:${media.type};base64,${media.base64}`
+      } : null
     };
 
     await Chat.updateOne(
@@ -70,10 +74,9 @@ export const appendMessages = async (req, res) => {
     if (model.startsWith('gemini')) {
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       let streamTargetModel = model || 'gemini-2.5-flash';
-      let responseStream;
 
       try {
-        responseStream = await ai.models.generateContentStream({
+        const responseStream = await ai.models.generateContentStream({
           model: streamTargetModel,
           contents: formatGeminiMessages(),
         });
@@ -83,12 +86,13 @@ export const appendMessages = async (req, res) => {
           aiTextOutput += chunkText;
           res.write(`data: ${JSON.stringify({ type: 'token', text: chunkText })}\n\n`);
         }
-      } catch (primaryGeminiError) {
-        console.error("⚠️ Primary Gemini Exception caught:", primaryGeminiError.message);
+      } catch (err) {
+        console.error("⚠️ Gemini Exception:", err.message);
         aiTextOutput = await runGroqBackupPipeline(fullConversationContext, res, aiTextOutput, media);
       }
     } else if (model.startsWith('grok') || model.startsWith('groq')) {
       try {
+        const groqClient = new Groq({ apiKey: process.env.GROQ_API_KEY });
         const groqFormattedMessages = fullConversationContext.map((msg, idx) => {
           const isCurrentPrompt = idx === fullConversationContext.length - 1;
           if (media && isCurrentPrompt && media.type.startsWith('image/')) {
@@ -108,10 +112,7 @@ export const appendMessages = async (req, res) => {
           content: "You are Aura. Structure outputs with Markdown headers, lists, bold text, and code blocks."
         });
 
-        const groqClient = new Groq({ apiKey: process.env.GROQ_API_KEY });
-
-        // Corrected model string for Groq vision tasks
-        const targetModel = (media && media.type.startsWith('image/')) ? 'llama-3.2-11b-vision-instruct' : 'llama-3.3-70b-versatile';
+        const targetModel = (media && media.type.startsWith('image/')) ? 'meta-llama/llama-4-scout-17b-16e-instruct' : 'llama-3.3-70b-versatile';
 
         const groqStream = await groqClient.chat.completions.create({
           model: targetModel,
@@ -129,15 +130,32 @@ export const appendMessages = async (req, res) => {
           }
         }
       } catch (groqError) {
-        console.error("❌ Groq Pipeline processing exception:", groqError.message);
+        console.error("❌ Groq Pipeline exception:", groqError.message);
         res.write(`data: ${JSON.stringify({ type: 'token', text: `\n\n⚠️ Groq Connection error: ${groqError.message}` })}\n\n`);
       }
     }
 
+    // Persist final state and generate title if it's the first exchange
     const aiResponseBlock = { role: 'model', text: aiTextOutput };
+    const isFirstMessagePair = activeChat.messages.length === 0;
+
+    let updateData = {
+      $push: { messages: aiResponseBlock },
+      $set: { updatedAt: Date.now() }
+    };
+
+    if (isFirstMessagePair) {
+      try {
+        const smartTitle = await generateSmartTitle(userMessage.text);
+        if (smartTitle) updateData.$set.title = smartTitle;
+      } catch (titleErr) {
+        console.warn("Title generation failed:", titleErr.message);
+      }
+    }
+
     const finalUpdatedChat = await Chat.findOneAndUpdate(
       { _id: chatId, userId: req.user.id },
-      { $push: { messages: aiResponseBlock }, $set: { updatedAt: Date.now() } },
+      updateData,
       { returnDocument: 'after' }
     );
 
@@ -180,7 +198,7 @@ const runGroqBackupPipeline = async (context, res, currentOutput, media) => {
         "Never return dense walls of plain text paragraphs. Always organize your knowledge using structured Markdown layout schemas."
     });
 
-    const targetModel = (media && media.type.startsWith('image/')) ? 'llama-3.2-11b-vision-preview' : 'llama-3.3-70b-versatile';
+    const targetModel = (media && media.type.startsWith('image/')) ? 'meta-llama/llama-4-scout-17b-16e-instruct' : 'llama-3.3-70b-versatile';
 
     const groqStream = await groqClient.chat.completions.create({
       model: targetModel,

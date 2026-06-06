@@ -309,7 +309,11 @@ export default function ChatPage() {
                   }
                 }
               } else if (parsedData.type === 'done') {
+                // The server returns the updated chat including all messages
                 setActiveChat(parsedData.chat);
+
+                setMessages(parsedData.chat.messages);
+
                 fetchChatHistory();
               }
             } catch (err) {

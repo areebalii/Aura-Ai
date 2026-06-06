@@ -10,6 +10,11 @@ const MessageSchema = new mongoose.Schema({
     type: String,
     required: true
   },
+  mediaContext: {
+    name: String,
+    type: { type: String },
+    url: String // This will store the Data URL (base64) or S3 link
+  },
   timestamp: {
     type: Date,
     default: Date.now
@@ -28,7 +33,7 @@ const ChatSchema = new mongoose.Schema({
     trim: true
   },
   messages: [MessageSchema],
-  updatedAt: {
+  updatedAt: { 
     type: Date,
     default: Date.now
   }

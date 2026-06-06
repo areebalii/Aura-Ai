@@ -9,7 +9,7 @@ export default function Sidebar({
   activeChatId,
   onSelectChat,
   onClose,
-  onDeleteChat // 👈 Added callback prop
+  onDeleteChat 
 }) {
   const navigate = useNavigate();
 
