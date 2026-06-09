@@ -11,6 +11,7 @@ web_stage/
 .env.production.local
 *.env
 *.secret.exs
+!example.env
 
 # Build outputs
 dist/
