@@ -13,7 +13,7 @@ const app = express();
 
 // Middleware
 app.use(cors({
-  origin: ['http://localhost:5173', 'https://aura-ai-two-blush.vercel.app'],
+  origin: ['http://localhost:5173', 'https://aura-ai-two-blush.vercel.app', "https://aura-75rmjha8f-areebalis-projects.vercel.app/"],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
