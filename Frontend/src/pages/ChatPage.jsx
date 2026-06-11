@@ -143,8 +143,8 @@ export default function ChatPage() {
       }
     } catch (err) {
       console.error("Error collecting chat analytics:", err);
-    } finally { 
-      setIsHistoryLoading(false); 
+    } finally {
+      setIsHistoryLoading(false);
     }
   };
 
@@ -208,16 +208,25 @@ export default function ChatPage() {
           return updated;
         });
 
+        // Ultra-smooth native scroll anchoring
         requestAnimationFrame(() => {
-          if (chatContainerRef.current) {
-            chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+          const container = chatContainerRef.current;
+          if (container && messagesEndRef.current) {
+            const offsetThreshold = 120;
+            const isUserAtBottom =
+              container.scrollHeight - container.scrollTop <= container.clientHeight + offsetThreshold;
+
+            if (isUserAtBottom) {
+              // Using 'auto' inside high-frequency intervals prevents stuttering 
+              messagesEndRef.current.scrollIntoView({ behavior: 'auto', block: 'end' });
+            }
           }
         });
       } else if (streamFinishedRef.current) {
         clearInterval(playbackIntervalRef.current);
         setIsStreaming(false);
       }
-    }, 30);
+    }, 30); // 30ms typing interval
   };
 
   const handleSend = async (e) => {
@@ -400,7 +409,7 @@ export default function ChatPage() {
 
       <div className={`fixed md:static inset-y-0 left-0 z-40 transform ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0 transition-transform duration-300 ease-in-out h-full`}>
         <Sidebar
-          isLoading={isHistoryLoading} 
+          isLoading={isHistoryLoading}
           chatHistory={chatHistory}
           onNewChat={handleNewChat}
           chatHistory={chatHistory}
